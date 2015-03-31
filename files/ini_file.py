@@ -1,8 +1,7 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 
-# (c) 2012, Jan-Piet Mens <jpmens () gmail.com>
-# (c) 2015, Ales Nosek <anosek.nosek () gmail.com>
+# (c) 2015, Chris Lajoie <ctlajoie@gmail.com>
 #
 # This file is part of Ansible
 #
@@ -27,9 +26,9 @@ short_description: Tweak settings in INI files
 extends_documentation_fragment: files
 description:
      - Manage (add, remove, change) individual settings in an INI-style file without having
-       to manage the file as a whole with, say, M(template) or M(assemble). Adds missing
-       sections if they don't exist.
-     - Before version 2.0, comments are discarded when the source file is read, and therefore will not show up in the destination file.
+       to manage the file as a whole with, say, M(template) or M(assemble).
+     - File is created if it does not exist. Missing sections are added.
+     - Comments and blank lines are preserved in existing files.
 version_added: "0.9"
 options:
   dest:
@@ -41,12 +40,11 @@ options:
     description:
       - Section name in INI file. This is added if C(state=present) automatically when
         a single value is being set.
-    required: true
+    required: false
     default: null
   option:
     description:
-      - if set (required for changing a I(value)), this is the name of the option.
-      - May be omitted if adding/removing a whole I(section).
+      - this is the name of the option. May be omitted if removing an entire I(section).
     required: false
     default: null
   value:
@@ -71,17 +69,7 @@ options:
      required: false
      default: "present"
      choices: [ "present", "absent" ]
-notes:
-   - While it is possible to add an I(option) without specifying a I(value), this makes
-     no sense.
-   - A section named C(default) cannot be added by the module, but if it exists, individual
-     options within the section can be updated. (This is a limitation of Python's I(ConfigParser).)
-     Either use M(template) to create a base INI file with a C([default]) section, or use
-     M(lineinfile) to add the missing line.
-requirements: [ ConfigParser ]
-author:
-    - "Jan-Piet Mens (@jpmens)"
-    - "Ales Nosek (@noseka1)"
+author: "Chris Lajoie (@ctlajoie)"
 '''
 
 EXAMPLES = '''
@@ -95,120 +83,172 @@ EXAMPLES = '''
             backup=yes
 '''
 
-import ConfigParser
 import sys
-import os
+import re
+import os.path
 
-# ==============================================================
-# match_opt
-
-def match_opt(option, line):
-  option = re.escape(option)
-  return re.match('%s *=' % option, line) \
-    or re.match('# *%s *=' % option, line) \
-    or re.match('; *%s *=' % option, line)
-
-# ==============================================================
-# match_active_opt
-
-def match_active_opt(option, line):
-  option = re.escape(option)
-  return re.match('%s *=' % option, line)
-
-# ==============================================================
-# do_ini
 
 def do_ini(module, filename, section=None, option=None, value=None, state='present', backup=False):
-
-
-    if not os.path.exists(filename):
-      try:
-        open(filename,'w').close()
-      except:
-        module.fail_json(msg="Destination file %s not writable" % filename)
-    ini_file = open(filename, 'r')
-    try:
-        ini_lines = ini_file.readlines()
-        # append a fake section line to simplify the logic
-        ini_lines.append('[')
-    finally:
-        ini_file.close()
-
-    within_section = not section
-    section_start = 0
     changed = False
 
-    for index, line in enumerate(ini_lines):
-        if line.startswith('[%s]' % section):
-            within_section = True
-            section_start = index
-        elif line.startswith('['):
-            if within_section:
-                if state == 'present':
-                    # insert missing option line at the end of the section
-                    ini_lines.insert(index, '%s = %s\n' % (option, value))
-                    changed = True
-                elif state == 'absent' and not option:
-                    # remove the entire section
-                    del ini_lines[section_start:index]
-                    changed = True
-                break
-        else:
-            if within_section and option:
-                if state == 'present':
-                    # change the existing option line
-                    if match_opt(option, line):
-                        newline = '%s = %s\n' % (option, value)
-                        changed = ini_lines[index] != newline
-                        ini_lines[index] = newline
-                        if changed:
-                            # remove all possible option occurences from the rest of the section
-                            index = index + 1
-                            while index < len(ini_lines):
-                                line = ini_lines[index]
-                                if line.startswith('['):
-                                    break
-                                if match_active_opt(option, line):
-                                    del ini_lines[index]
-                                else:
-                                    index = index + 1
-                        break
-                else:
-                    # comment out the existing option line
-                    if match_active_opt(option, line):
-                        ini_lines[index] = '#%s' % ini_lines[index]
-                        changed = True
-                        break
+    ini = IniFile(filename)
 
-    # remove the fake section line
-    del ini_lines[-1:]
+    if state == 'present':
+        if option and value != ini.get_option(section, option):
+            ini.set_option(section, option, value)
+            changed = True
 
-    if not within_section and option and state == 'present':
-        ini_lines.append('[%s]\n' % section)
-        ini_lines.append('%s = %s\n' % (option, value))
-        changed = True
-
+    if state == 'absent':
+        if section and not option:
+            #delete entire section
+            changed = ini.del_section(section)
+        elif option:
+            #delete single option
+            changed = ini.del_option(section, option)
 
     if changed and not module.check_mode:
         if backup:
             module.backup_local(filename)
-        ini_file = open(filename, 'w')
+
         try:
-            ini_file.writelines(ini_lines)
-        finally:
-            ini_file.close()
+            ini.save()
+        except:
+            module.fail_json(msg="Can't create %s" % filename)
 
     return changed
 
-# ==============================================================
-# main
+
+class IniFile(object):
+    def __init__(self, filepath):
+        self.rx_option = re.compile('^([^\s=]+)\s*=\s*(.*)')
+        self.rx_section = re.compile('^\[([^\]]+)\]')
+        self.filepath = filepath
+        if os.path.isfile(filepath):
+            f = open(filepath)
+            try:
+                self.lines = f.readlines()
+            finally:
+                f.close
+        else:
+            self.lines = []
+
+
+    def save(self):
+        f = open(filepath)
+        try:
+            f.writelines(self.lines)
+        finally:
+            f.close
+
+    def get_option(self, section, option):
+        cur_section = None
+        for lineno in range(len(self.lines)):
+            line = self.lines[lineno].strip()
+            if len(line) == 0 or line.startswith('#') or line.startswith(';'):
+                continue;
+
+            match = self.rx_option.match(line)
+            if match:
+                opt, value = match.group(1, 2)
+                if cur_section == section and opt == option:
+                    return value
+                continue
+
+            match = self.rx_section.match(line)
+            if match:
+                cur_section = match.group(1)
+                continue
+
+    def set_option(self, section, option, value):
+        cur_section = None
+        lineno = last_opt_line = 0
+        for lineno in range(len(self.lines)):
+            line = self.lines[lineno].strip()
+            if len(line) == 0:
+                continue
+
+            if line.startswith('#') or line.startswith(';'):
+                last_opt_line = lineno
+                continue
+
+            match = self.rx_option.match(line)
+            if match:
+                opt = match.group(1)
+                if cur_section == section and opt == option:
+                    self.lines[lineno] = "%s = %s\n" % (option, value)
+                    return
+                last_opt_line = lineno
+                continue
+
+            match = self.rx_section.match(line)
+            if match:
+                #if we're about to leave the desired section, insert our option at the end of it
+                if cur_section == section:
+                    self.lines[last_opt_line+1:last_opt_line+1] = "%s = %s\n" % (option, value)
+                    return
+                cur_section = match.group(1)
+                last_opt_line = lineno
+                continue
+
+        if cur_section != section:
+            #the desired section doesn't exist, so add it
+            if lineno > 0 and lineno - last_opt_line < 2:
+                self.lines.extend("\n") #add line before section header for readability
+            self.lines.extend("[%s]\n" % section)
+            #and now insert the option
+            self.lines.extend("%s = %s\n" % (option, value))
+        else:
+            #option wasn't found so we need to add it
+            self.lines[last_opt_line+1:last_opt_line+1] = "%s = %s\n" % (option, value)
+
+
+
+    def del_option(self, section, option):
+        cur_section = None
+        for lineno in range(len(self.lines)):
+            line = self.lines[lineno].strip()
+            if len(line) == 0 or line.startswith('#') or line.startswith(';'):
+                continue
+
+            match = self.rx_option.match(line)
+            if match:
+                opt = match.group(1)
+                if cur_section == section and opt == option:
+                    del self.lines[lineno]
+                    return True
+                continue
+
+            match = self.rx_section.match(line)
+            if match:
+                cur_section = match.group(1)
+                continue
+
+        return False
+
+    def del_section(self, section):
+        section_start = None
+        for lineno in range(len(self.lines)):
+            line = self.lines[lineno].strip()
+
+            match = self.rx_section.match(line)
+            if match and match.group(1) == section:
+                section_start = lineno
+            elif match and section_start != None:
+                del self.lines[section_start:lineno]
+                return True
+
+        if section_start != None:
+            del self.lines[section_start:]
+            return True
+
+        return False
+
 
 def main():
-
     module = AnsibleModule(
         argument_spec = dict(
             dest = dict(required=True),
-            section = dict(required=True),
+            section = dict(required=False),
             option = dict(required=False),
             value = dict(required=False),
             backup = dict(default='no', type='bool'),
@@ -217,8 +257,6 @@ def main():
         add_file_common_args = True,
         supports_check_mode = True
     )
-
-    info = dict()
 
     dest = os.path.expanduser(module.params['dest'])
     section = module.params['section']
