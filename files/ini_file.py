@@ -184,7 +184,8 @@ class IniFile(object):
             if match:
                 #if we're about to leave the desired section, insert our option at the end of it
                 if cur_section == section:
-                    self.lines[last_opt_line+1:last_opt_line+1] = "%s = %s\n" % (option, value)
+                    ins_index = last_opt_line > 0 and last_opt_line + 1 or 0
+                    self.lines[ins_index:ins_index] = "%s = %s\n" % (option, value)
                     return
                 cur_section = match.group(1)
                 last_opt_line = lineno
