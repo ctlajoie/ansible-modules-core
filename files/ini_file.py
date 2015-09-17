@@ -134,7 +134,7 @@ class IniFile(object):
 
 
     def save(self):
-        f = open(filepath)
+        f = open(filepath, 'w')
         try:
             f.writelines(self.lines)
         finally:
